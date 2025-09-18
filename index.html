@@ -1,0 +1,144 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Babylon.js — Mixamo Sit Scene with HDR</title>
+  <style>
+    html,body { width:100%; height:100%; margin:0; padding:0; overflow:hidden; }
+    #renderCanvas { width:100%; height:100%; display:block; background:#eef7ff; }
+  </style>
+</head>
+<body>
+  <canvas id="renderCanvas"></canvas>
+
+  <!-- Babylon.js -->
+  <script src="https://cdn.babylonjs.com/babylon.js"></script>
+  <script src="https://cdn.babylonjs.com/loaders/babylonjs.loaders.min.js"></script>
+
+  <script>
+  (async function () {
+    const canvas = document.getElementById('renderCanvas');
+    const engine = new BABYLON.Engine(canvas, true, {preserveDrawingBuffer:true, stencil:true});
+    const scene = new BABYLON.Scene(engine);
+
+    // === Load HDR environment as background & lighting ===
+    const hdrTexture = BABYLON.CubeTexture.CreateFromPrefilteredData(
+      "assets/river_rocks_4k_djrgud6u.hdr.env", // put HDR env in assets/
+      scene
+    );
+    scene.environmentTexture = hdrTexture;
+    scene.createDefaultSkybox(hdrTexture, true, 1000, 0); // show HDR as skybox
+    scene.environmentIntensity = 1.5;
+
+    // Camera
+    const camera = new BABYLON.UniversalCamera('camera', new BABYLON.Vector3(1.6, 1.4, 1.2), scene);
+    camera.setTarget(new BABYLON.Vector3(0, 0.9, 0));
+    camera.attachControl(canvas, true);
+    camera.minZ = 0.1;
+
+    // Lights (HDR gives most lighting, but we add some extra)
+    const hemi = new BABYLON.HemisphericLight('hemi', new BABYLON.Vector3(0,1,0), scene);
+    hemi.intensity = 1.2;
+    const dir = new BABYLON.DirectionalLight('dir', new BABYLON.Vector3(-0.6,-1,0.4), scene);
+    dir.position = new BABYLON.Vector3(5,10,5);
+    dir.intensity = 1.0;
+
+    // Ground (green so character doesn’t float)
+    const ground = BABYLON.MeshBuilder.CreateGround('ground', {width:12, height:12}, scene);
+    ground.position.y = 0;
+    ground.receiveShadows = true;
+    const groundMat = new BABYLON.StandardMaterial("groundMat", scene);
+    groundMat.diffuseColor = new BABYLON.Color3(0.2, 0.7, 0.2); // green
+    ground.material = groundMat;
+
+    // Load character
+    const assetsPath = "assets/";
+    const fileName = "character.glb"; // your Mixamo-exported GLB
+    await new Promise((resolve, reject) => {
+      BABYLON.SceneLoader.Append(assetsPath, fileName, scene,
+        () => resolve(),
+        null,
+        (scene, message, exception) => { console.error("Load failed:", message, exception); reject(message); }
+      );
+    });
+
+    const rootMesh = scene.meshes.find(m => /character|mixamo|root/i.test(m.name)) || scene.meshes[scene.meshes.length - 1];
+    const skeleton = scene.skeletons.length ? scene.skeletons[0] : null;
+
+    console.log("Meshes loaded:", scene.meshes.length, "Skeletons:", scene.skeletons.length);
+    console.log("Animation groups:", scene.animationGroups.map(a=>a.name));
+
+    // Idle/talk animation
+    let talkGroup = scene.animationGroups.find(g => /talk|talking|idle/i.test(g.name));
+    if (!talkGroup && scene.animationGroups.length) talkGroup = scene.animationGroups[0];
+    if (talkGroup) talkGroup.play(true);
+
+    // Function to play a one-time fidget pose
+    function playPoseOnce(matchPattern) {
+      const g = scene.animationGroups.find(a => new RegExp(matchPattern, 'i').test(a.name));
+      if (!g) return false;
+      if (talkGroup) talkGroup.pause();
+      try { if (g.reset) g.reset(); } catch(e) {}
+      g.play(false);
+      if (g.onAnimationGroupEndObservable) {
+        g.onAnimationGroupEndObservable.addOnce(()=> { if (talkGroup) talkGroup.play(true); });
+      } else {
+        setTimeout(()=> { if (talkGroup) talkGroup.play(true); }, 1000);
+      }
+      return true;
+    }
+
+    // Occasionally trigger a shift/fidget
+    setInterval(() => {
+      if (Math.random() < 0.28) {
+        playPoseOnce('shift|fidget|adjust|pose|sit');
+      }
+    }, 3500 + Math.random() * 3000);
+
+    // Head turns
+    if (skeleton) {
+      const headBone = skeleton.bones.find(b => /head|neck/i.test(b.name));
+      if (headBone) {
+        const baseQuat = headBone.rotationQuaternion ? headBone.rotationQuaternion.clone()
+                        : BABYLON.Quaternion.FromEulerVector(new BABYLON.Vector3(
+                            headBone.rotation.x||0, headBone.rotation.y||0, headBone.rotation.z||0));
+        let turnState = null;
+        scene.onBeforeRenderObservable.add(() => {
+          if (!turnState) return;
+          const dt = engine.getDeltaTime() / 1000;
+          turnState.t += dt / turnState.dur;
+          if (turnState.t >= 1) {
+            headBone.rotationQuaternion = turnState.to.clone();
+            const cb = turnState.onEnd; turnState = null; if (cb) cb();
+          } else {
+            headBone.rotationQuaternion = BABYLON.Quaternion.Slerp(turnState.from, turnState.to, turnState.t);
+          }
+        });
+        function triggerHeadTurn() {
+          const rootPos = rootMesh.getAbsolutePosition();
+          const dir = camera.position.subtract(rootPos);
+          const yaw = Math.atan2(dir.x, dir.z);
+          const smallYaw = yaw * 0.22;
+          const targetEuler = new BABYLON.Vector3(0, smallYaw, 0);
+          const from = headBone.rotationQuaternion ? headBone.rotationQuaternion.clone() : baseQuat.clone();
+          const to = BABYLON.Quaternion.FromEulerVector(targetEuler).multiply(from);
+          turnState = { from, to, t: 0, dur: 0.45, onEnd: () => {
+            setTimeout(() => {
+              const retFrom = headBone.rotationQuaternion ? headBone.rotationQuaternion.clone() : to.clone();
+              const retTo = baseQuat.clone();
+              turnState = { from: retFrom, to: retTo, t:0, dur: 0.7 };
+            }, 600 + Math.random() * 900);
+          }};
+        }
+        setInterval(() => { if (Math.random() < 0.36) triggerHeadTurn(); }, 3000 + Math.random() * 3000);
+      }
+    }
+
+    // Render loop
+    engine.runRenderLoop(()=> scene.render());
+    window.addEventListener('resize', ()=> engine.resize());
+
+  })();
+  </script>
+</body>
+</html>
